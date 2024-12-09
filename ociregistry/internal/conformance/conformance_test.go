@@ -22,14 +22,11 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
-	"slices"
 	"sort"
-	"strings"
 	"testing"
 
 	"github.com/go-quicktest/qt"
@@ -64,60 +61,6 @@ func TestClientAsProxy(t *testing.T) {
 	runTests(t, func(t *testing.T) string {
 		direct := httptest.NewServer(ociserver.New(ocimem.New(), &ociserver.Options{
 			DebugID: "direct",
-		}))
-		t.Cleanup(direct.Close)
-		proxy := httptest.NewServer(ociserver.New(mustNewOCIClient(direct.URL, &ociclient.Options{
-			// Make sure that we exercise the paging functionality.
-			ListPageSize: 2,
-			DebugID:      "proxyClient",
-		}), &ociserver.Options{
-			DebugID: "proxy",
-		}))
-		t.Cleanup(proxy.Close)
-		return proxy.URL
-	})
-}
-
-func TestClientAsProxyWithNoLinkHeaders(t *testing.T) {
-	runTests(t, func(t *testing.T) string {
-		direct := httptest.NewServer(ociserver.New(ocimem.New(), &ociserver.Options{
-			DebugID:                     "direct",
-			OmitLinkHeaderFromResponses: true,
-		}))
-		t.Cleanup(direct.Close)
-		proxy := httptest.NewServer(ociserver.New(mustNewOCIClient(direct.URL, &ociclient.Options{
-			// Make sure that we exercise the paging functionality.
-			ListPageSize: 2,
-			DebugID:      "proxyClient",
-		}), &ociserver.Options{
-			DebugID: "proxy",
-		}))
-		t.Cleanup(proxy.Close)
-		return proxy.URL
-	})
-}
-
-func TestClientAsProxyWithMaxPageSize(t *testing.T) {
-	runTests(t, func(t *testing.T) string {
-		direct := httptest.NewServer(ociserver.New(ocimem.New(), &ociserver.Options{
-			DebugID:         "direct",
-			MaxListPageSize: 1000,
-		}))
-		t.Cleanup(direct.Close)
-		proxy := httptest.NewServer(ociserver.New(mustNewOCIClient(direct.URL, nil), &ociserver.Options{
-			DebugID:         "proxy",
-			MaxListPageSize: 1000,
-		}))
-		t.Cleanup(proxy.Close)
-		return proxy.URL
-	})
-}
-
-func TestClientAsProxyWithOmittedTagGetDigest(t *testing.T) {
-	runTests(t, func(t *testing.T) string {
-		direct := httptest.NewServer(ociserver.New(ocimem.New(), &ociserver.Options{
-			DebugID:                      "direct",
-			OmitDigestFromTagGetResponse: true,
 		}))
 		t.Cleanup(direct.Close)
 		proxy := httptest.NewServer(ociserver.New(mustNewOCIClient(direct.URL, nil), &ociserver.Options{
@@ -205,15 +148,6 @@ var extraTests = []struct {
 }, {
 	testName: "referrers",
 	run:      testReferrers,
-}, {
-	testName: "largeManifest",
-	run:      testLargeManifest,
-}, {
-	testName: "manyTags",
-	run:      testManyTags,
-}, {
-	testName: "manyRepos",
-	run:      testManyRepos,
 }}
 
 // testExtra runs a bunch of extra tests of functionality that isn't
@@ -232,57 +166,6 @@ func testExtra(t *testing.T, startSrv func(*testing.T) string) {
 			test.run(t, client)
 		})
 	}
-}
-
-func testManyTags(t *testing.T, client *remote.Registry) {
-	ctx := context.Background()
-	client.TagListPageSize = 5
-	repo, err := client.Repository(ctx, "some-repo")
-	qt.Assert(t, qt.IsNil(err))
-	configDesc := push(t, repo.Blobs(), "application/json", []byte("{}"))
-	layer0Desc := push(t, repo.Blobs(), "", []byte("some content"))
-	manifestDesc := pushJSON(t, repo.Manifests(), ocispec.MediaTypeImageManifest, ociregistry.Manifest{
-		MediaType: ocispec.MediaTypeImageManifest,
-		Config:    withMediaType(configDesc, "artifact1"),
-		Layers:    []ociregistry.Descriptor{layer0Desc},
-	})
-	var tags []string
-	for i := 0; i < 37; i++ {
-		tag := fmt.Sprintf("tag%d", i)
-		err = repo.Manifests().Tag(ctx, manifestDesc, tag)
-		qt.Assert(t, qt.IsNil(err))
-		tags = append(tags, tag)
-	}
-	t.Logf("XXXX pushed all content and tags")
-	slices.Sort(tags)
-	var gotTags []string
-	err = repo.Tags(ctx, "", func(tags []string) error {
-		gotTags = append(gotTags, tags...)
-		return nil
-	})
-	qt.Assert(t, qt.IsNil(err))
-	qt.Assert(t, qt.DeepEquals(gotTags, tags))
-}
-
-func testManyRepos(t *testing.T, client *remote.Registry) {
-	ctx := context.Background()
-	var repos []string
-	for i := 0; i < 37; i++ {
-		repoName := fmt.Sprintf("repo%d", i)
-		repo, err := client.Repository(ctx, repoName)
-		qt.Assert(t, qt.IsNil(err))
-		push(t, repo.Blobs(), "", []byte("hello "+repoName))
-		repos = append(repos, repoName)
-	}
-	t.Logf("XXXX pushed all repos")
-	slices.Sort(repos)
-	var gotRepos []string
-	err := client.Repositories(ctx, "", func(repos []string) error {
-		gotRepos = append(gotRepos, repos...)
-		return nil
-	})
-	qt.Assert(t, qt.IsNil(err))
-	qt.Assert(t, qt.DeepEquals(gotRepos, repos))
 }
 
 func testCatalog(t *testing.T, client *remote.Registry) {
@@ -304,7 +187,7 @@ func testCatalog(t *testing.T, client *remote.Registry) {
 		return nil
 	})
 	qt.Assert(t, qt.IsNil(err))
-	slices.Sort(repos)
+	sort.Strings(repos)
 	qt.Assert(t, qt.DeepEquals(gotRepos, repos))
 }
 
@@ -358,38 +241,6 @@ func testReferrers(t *testing.T, client *remote.Registry) {
 
 }
 
-func testLargeManifest(t *testing.T, client *remote.Registry) {
-	ctx := context.Background()
-	repo, err := client.Repository(ctx, "some/repo")
-	qt.Assert(t, qt.IsNil(err))
-	configDesc := push(t, repo.Blobs(), "application/json", []byte("{}"))
-	layer0Desc := push(t, repo.Blobs(), "", []byte("some content"))
-	manifestDesc := pushJSON(t, repo.Manifests(), ocispec.MediaTypeImageManifest, ociregistry.Manifest{
-		MediaType: ocispec.MediaTypeImageManifest,
-		Config:    withMediaType(configDesc, "artifact1"),
-		Layers:    []ociregistry.Descriptor{layer0Desc},
-		Annotations: map[string]string{
-			// Note: this is larger than ociclient.inMemThreshold
-			// to force that code to hit the non-buffered code path.
-			"somethingLarge": strings.Repeat("a", 256*1024),
-		},
-	})
-	err = repo.Manifests().Tag(ctx, manifestDesc, "someTag")
-	qt.Assert(t, qt.IsNil(err))
-
-	// The ORAS API doesn't seem to provide any API to fetch
-	// a manifest directly by tag, so use the HTTP client directly.
-	req, err := http.NewRequest("GET", "http://"+client.Reference.Registry+"/v2/some/repo/manifests/someTag", nil)
-	qt.Assert(t, qt.IsNil(err))
-	resp, err := http.DefaultClient.Do(req)
-	qt.Assert(t, qt.IsNil(err))
-	data, err := io.ReadAll(resp.Body)
-	qt.Assert(t, qt.IsNil(err))
-	qt.Assert(t, qt.Equals(resp.StatusCode, http.StatusOK), qt.Commentf("response body: %q", data))
-	qt.Assert(t, qt.Equals(digest.FromBytes(data), manifestDesc.Digest))
-	qt.Assert(t, qt.Equals(int64(len(data)), manifestDesc.Size))
-}
-
 var extraWithLocalClientTests = []struct {
 	testName string
 	run      func(t *testing.T, reg ociregistry.Interface)
@@ -424,8 +275,9 @@ func mustNewOCIClient(srvURL string, opts *ociclient.Options) ociregistry.Interf
 	if err != nil {
 		panic(err)
 	}
-	opts.Insecure = u.Scheme == "http"
-	client, err := ociclient.New(u.Host, opts)
+	client, err := ociclient.New(u.Host, &ociclient.Options{
+		Insecure: u.Scheme == "http",
+	})
 	if err != nil {
 		panic(err)
 	}

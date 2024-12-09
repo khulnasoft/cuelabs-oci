@@ -20,7 +20,7 @@ jobs:
       Dispatch-Trailer: {"type":"'))
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -51,19 +51,22 @@ jobs:
           Dispatch-Trailer: {"type":"'))
         name: Check we don't have Dispatch-Trailer on a protected branch
         run: |-
-          echo "github.event.head_commit.message contains Dispatch-Trailer but we are on a protected branch"
+          echo "github.event.head_commit.message contains Dispatch-Trailer"
+          echo "github.event.head_commit.message value"
+          cat <<EOD
+          ${{ github.event.head_commit.message }}
+          EOD
+          echo "containsDispatchTrailer expression"
+          cat <<EOD
+          (contains(github.event.head_commit.message, '
+          Dispatch-Trailer: {"type":"'))
+          EOD
           false
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v4
         with:
           cache: false
-          go-version: 1.22.x
-      - name: Set common go env vars
-        run: |-
-          go env -w GOTOOLCHAIN=local
-
-          # Dump env for good measure
-          go env
+          go-version: 1.21.x
       - id: go-mod-cache-dir
         name: Get go mod cache directory
         run: echo "dir=$(go env GOMODCACHE)" >> ${GITHUB_OUTPUT}
@@ -73,29 +76,81 @@ jobs:
       - if: |-
           (((github.ref == 'refs/heads/main') && (! (contains(github.event.head_commit.message, '
           Dispatch-Trailer: {"type":"')))) || (github.ref == 'refs/heads/ci/test'))
-        uses: actions/cache@v4
+        uses: actions/cache@v3
         with:
           path: |-
             ${{ steps.go-mod-cache-dir.outputs.dir }}/cache/download
             ${{ steps.go-cache-dir.outputs.dir }}
-          key: ${{ runner.os }}-1.22.x-${{ github.run_id }}
-          restore-keys: ${{ runner.os }}-1.22.x
+          key: ${{ runner.os }}-1.21.x-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-1.21.x
       - if: |-
           ! (((github.ref == 'refs/heads/main') && (! (contains(github.event.head_commit.message, '
           Dispatch-Trailer: {"type":"')))) || (github.ref == 'refs/heads/ci/test'))
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v3
         with:
           path: |-
             ${{ steps.go-mod-cache-dir.outputs.dir }}/cache/download
             ${{ steps.go-cache-dir.outputs.dir }}
-          key: ${{ runner.os }}-1.22.x-${{ github.run_id }}
-          restore-keys: ${{ runner.os }}-1.22.x
+          key: ${{ runner.os }}-1.21.x-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-1.21.x
       - if: |-
           github.repository == 'cue-labs/oci' && (((github.ref == 'refs/heads/main') && (! (contains(github.event.head_commit.message, '
           Dispatch-Trailer: {"type":"')))) || github.ref == 'refs/heads/ci/test')
         run: go clean -testcache
       - name: Early git and code sanity checks
-        run: go run cuelang.org/go/internal/ci/checks@v0.11.0-0.dev.0.20240903133435-46fb300df650
+        run: |-
+          # Ensure the recent commit messages have Signed-off-by headers. We
+          # only need to check the HEAD commit because all commits are tested
+          # in CI. Unclear why git log outputs blank lines when parsing trailers
+          # in this way, but we remove those blank lines so as not to skew the
+          # count of the trailers we are searching for.
+          #
+          # TODO: Remove once this is enforced for admins too;
+          # see https://bugs.chromium.org/p/gerrit/issues/detail?id=15229
+          if [[ "$(git log -1 --pretty='%(trailers:key=Signed-off-by)' | sed '/^\s*$/d' | wc -l)" -eq 0 ]]; then
+          	echo -e "\nRecent commit is lacking Signed-off-by:\n"
+          	git show --quiet
+          	exit 1
+          fi
+
+          # Ensure that commit messages have a blank second line.
+          # We know that a commit message must be longer than a single
+          # line because each commit must be signed-off.
+          if git log --format=%B -n 1 HEAD | sed -n '2{/^$/{q1}}'; then
+          	echo "second line of commit message must be blank"
+          	exit 1
+          fi
+
+          # Ensure that the commit author is the same as the signed-off-by.  This
+          # is a basic requirement of DCO. It is enforced by Gerrit (although
+          # noting that in Gerrit the author name does not have to match, only
+          # the email address), but _not_ by the DCO GitHub app:
+          #
+          #   https://github.com/dcoapp/app/issues/201
+          #
+          # Provide a sanity check as part of GitHub workflows that should enforce
+          # this, e.g. trybot workflows.
+          #
+          # We do so by comparing the commit author and "Signed-off-by" trailer for
+          # strict equality. Whilst this is more strict than Gerrit, it should
+          # generally be the case, and we can always relax this when presented with
+          # specific situations where it is is a problem.
+
+          # commit author email address
+          commitauthor="$(git log -1 --pretty="%ae")"
+
+          # signed-off-by trailer email address. There is no way to parse just the
+          # email address from the trailer in the same way as git log, so instead
+          # grab the relevant trailer and then take the last whitespace-delimited
+          # part as the "<>" contained email address.
+          # Getting the Signed-off-by trailer in this way causes blank
+          # lines for some reason. Use awk to remove them.
+          commitsigner="$(git log -1 --pretty='%(trailers:key=Signed-off-by,valueonly)' | sed -ne 's/.* <\(.*\)>/\1/p')"
+
+          if [[ "$commitauthor" != "$commitsigner" ]]; then
+          	echo "commit author email address does not match signed-off-by trailer"
+          	exit 1
+          fi
       - name: Generate cmd/ocisrv
         run: go generate ./...
         working-directory: cmd/ocisrv
@@ -217,6 +272,5 @@ jobs:
         env:
           GOWORK: "off"
       - run: go work sync
-      - if: always()
-        name: Check that git is clean at the end of the job
+      - name: Check that git is clean at the end of the job
         run: test -z "$(git status --porcelain)" || (git status; git diff; false)

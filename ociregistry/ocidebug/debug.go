@@ -136,7 +136,7 @@ func (r *logger) PushBlobChunkedResume(ctx context.Context, repoName, id string,
 }
 
 func (r *logger) PushManifest(ctx context.Context, repoName string, tag string, data []byte, mediaType string) (ociregistry.Descriptor, error) {
-	r.logf("PushManifest %s tag=%q mediaType=%q data=%q {", repoName, tag, mediaType, data)
+	r.logf("PushManifest %s tag=%q mediaType=%q data=%q {", repoName, tag, data, mediaType)
 	desc, err := r.r.PushManifest(ctx, repoName, tag, data, mediaType)
 	if err != nil {
 		r.logf("} -> %v", err)
@@ -146,28 +146,19 @@ func (r *logger) PushManifest(ctx context.Context, repoName string, tag string, 
 	return desc, err
 }
 
-func (r *logger) Referrers(ctx context.Context, repoName string, digest ociregistry.Digest, artifactType string) ociregistry.Seq[ociregistry.Descriptor] {
-	return logIterReturn(
-		r,
-		fmt.Sprintf("Referrers %s %s %q", repoName, digest, artifactType),
-		r.r.Referrers(ctx, repoName, digest, artifactType),
-	)
+func (r *logger) Referrers(ctx context.Context, repoName string, digest ociregistry.Digest, artifactType string) ociregistry.Iter[ociregistry.Descriptor] {
+	r.logf("Referrers %s %s %q {", repoName, digest, artifactType)
+	return logIterReturn(r, r.r.Referrers(ctx, repoName, digest, artifactType))
 }
 
-func (r *logger) Repositories(ctx context.Context, startAfter string) ociregistry.Seq[string] {
-	return logIterReturn(
-		r,
-		fmt.Sprintf("Repositories startAfter: %q", startAfter),
-		r.r.Repositories(ctx, startAfter),
-	)
+func (r *logger) Repositories(ctx context.Context) ociregistry.Iter[string] {
+	r.logf("Repositories {")
+	return logIterReturn(r, r.r.Repositories(ctx))
 }
 
-func (r *logger) Tags(ctx context.Context, repoName string, startAfter string) ociregistry.Seq[string] {
-	return logIterReturn(
-		r,
-		fmt.Sprintf("Tags %s startAfter: %q", repoName, startAfter),
-		r.r.Tags(ctx, repoName, startAfter),
-	)
+func (r *logger) Tags(ctx context.Context, repoName string) ociregistry.Iter[string] {
+	r.logf("Tags %s {", repoName)
+	return logIterReturn(r, r.r.Tags(ctx, repoName))
 }
 
 func (r *logger) ResolveBlob(ctx context.Context, repoName string, digest ociregistry.Digest) (ociregistry.Descriptor, error) {
@@ -257,31 +248,31 @@ func (w blobWriter) Cancel() error {
 	return err
 }
 
-func logIterReturn[T any](r *logger, initialMsg string, it ociregistry.Seq[T]) ociregistry.Seq[T] {
-	return func(yield func(T, error) bool) {
-		r.logf("%s {", initialMsg)
-		items := []T{}
-		var _err error
-		it(func(item T, err error) bool {
-			if err != nil {
-				yield(*new(T), err)
-				_err = err
-				return false
-			}
-			ok := yield(item, err)
-			if ok {
-				items = append(items, item)
-			}
-			return ok
-		})
-		if _err != nil {
-			if len(items) > 0 {
-				r.logf("} -> %#v, %v", items, _err)
-			} else {
-				r.logf("} -> %v", _err)
-			}
+func logIterReturn[T any](r *logger, it ociregistry.Iter[T]) ociregistry.Iter[T] {
+	items, err := ociregistry.All(it)
+	if err != nil {
+		if len(items) > 0 {
+			r.logf("} -> %#v, %v", items, err)
 		} else {
-			r.logf("} -> %#v", items)
+			r.logf("} -> %v", err)
 		}
+	} else {
+		r.logf("} -> %#v", items)
 	}
+	if err == nil {
+		return ociregistry.SliceIter(items)
+	}
+	return errIter[T]{
+		ociregistry.SliceIter(items),
+		err,
+	}
+}
+
+type errIter[T any] struct {
+	ociregistry.Iter[T]
+	err error
+}
+
+func (it errIter[T]) Error() error {
+	return it.err
 }

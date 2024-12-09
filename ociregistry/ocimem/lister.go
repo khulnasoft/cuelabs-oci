@@ -16,34 +16,33 @@ package ocimem
 
 import (
 	"context"
-	"slices"
-	"strings"
+	"sort"
 
 	"cuelabs.dev/go/oci/ociregistry"
 )
 
-func (r *Registry) Repositories(ctx context.Context, startAfter string) ociregistry.Seq[string] {
+func (r *Registry) Repositories(ctx context.Context) ociregistry.Iter[string] {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return mapKeysIter(r.repos, strings.Compare, startAfter)
+	return mapKeysIter(r.repos, stringLess)
 }
 
-func (r *Registry) Tags(ctx context.Context, repoName string, startAfter string) ociregistry.Seq[string] {
+func (r *Registry) Tags(ctx context.Context, repoName string) ociregistry.Iter[string] {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	repo, err := r.repo(repoName)
 	if err != nil {
-		return ociregistry.ErrorSeq[string](err)
+		return ociregistry.ErrorIter[string](err)
 	}
-	return mapKeysIter(repo.tags, strings.Compare, startAfter)
+	return mapKeysIter(repo.tags, stringLess)
 }
 
-func (r *Registry) Referrers(ctx context.Context, repoName string, digest ociregistry.Digest, artifactType string) ociregistry.Seq[ociregistry.Descriptor] {
+func (r *Registry) Referrers(ctx context.Context, repoName string, digest ociregistry.Digest, artifactType string) ociregistry.Iter[ociregistry.Descriptor] {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	repo, err := r.repo(repoName)
 	if err != nil {
-		return ociregistry.ErrorSeq[ociregistry.Descriptor](err)
+		return ociregistry.ErrorIter[ociregistry.Descriptor](err)
 	}
 	var referrers []ociregistry.Descriptor
 	for _, b := range repo.manifests {
@@ -53,21 +52,27 @@ func (r *Registry) Referrers(ctx context.Context, repoName string, digest ocireg
 		// TODO filter by artifact type
 		referrers = append(referrers, b.descriptor())
 	}
-	slices.SortFunc(referrers, compareDescriptor)
-	return ociregistry.SliceSeq(referrers)
+	sort.Slice(referrers, func(i, j int) bool {
+		return descriptorLess(referrers[i], referrers[j])
+	})
+	return ociregistry.SliceIter(referrers)
 }
 
-func mapKeysIter[K comparable, V any](m map[K]V, cmp func(K, K) int, startAfter K) ociregistry.Seq[K] {
+func mapKeysIter[K comparable, V any](m map[K]V, less func(K, K) bool) ociregistry.Iter[K] {
 	ks := make([]K, 0, len(m))
 	for k := range m {
-		if cmp(startAfter, k) < 0 {
-			ks = append(ks, k)
-		}
+		ks = append(ks, k)
 	}
-	slices.SortFunc(ks, cmp)
-	return ociregistry.SliceSeq(ks)
+	sort.Slice(ks, func(i, j int) bool {
+		return less(ks[i], ks[j])
+	})
+	return ociregistry.SliceIter(ks)
 }
 
-func compareDescriptor(d0, d1 ociregistry.Descriptor) int {
-	return strings.Compare(string(d0.Digest), string(d1.Digest))
+func stringLess(s1, s2 string) bool {
+	return s1 < s2
+}
+
+func descriptorLess(d1, d2 ociregistry.Descriptor) bool {
+	return d1.Digest < d2.Digest
 }

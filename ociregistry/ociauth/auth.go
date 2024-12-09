@@ -1,7 +1,6 @@
 package ociauth
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,81 +8,80 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"cuelabs.dev/go/oci/ociregistry"
+	"cuelabs.dev/go/oci/ociregistry/internal/exp/slices"
 )
 
 // TODO decide on a good value for this.
 const oauthClientID = "cuelabs-ociauth"
 
+// Authorizer defines a way to make authorized requests using the OCI
+// authorization scope mechanism. See [StdAuthorizer] for an implementation
+// that understands the usual OCI authorization mechanisms.
+type Authorizer interface {
+	// DoRequest acquires authorization and invokes the given
+	// request. It may invoke the request more than once, and can
+	// use [http.Request.GetBody] to reset the request body if it
+	// gets consumed.
+	//
+	// It ensures that the authorization token used will have at least
+	// the capability to execute operations in requiredScope; any scope
+	// inside the context (see [ContextWithScope]) may also be taken
+	// into account when acquiring new tokens.
+	//
+	// It's OK to call AuthorizeRequest concurrently.
+	DoRequest(req *http.Request, requiredScope Scope) (*http.Response, error)
+}
+
 var ErrNoAuth = fmt.Errorf("no authorization token available to add to request")
 
-// stdTransport implements [http.RoundTripper] by acquiring authorization tokens
-// using the flows implemented
+// StdAuthorizer implements [Authorizer] using the flows implemented
 // by the usual docker clients. Note that this is _not_ documented as
 // part of any official OCI spec.
 //
 // See https://distribution.github.io/distribution/spec/auth/token/ for an overview.
-type stdTransport struct {
+type StdAuthorizer struct {
 	config     Config
-	transport  http.RoundTripper
+	httpClient HTTPDoer
 	mu         sync.Mutex
 	registries map[string]*registry
 }
 
-type StdTransportParams struct {
-	// Config represents the underlying configuration file information.
-	// It is consulted for authorization information on the hosts
-	// to which the HTTP requests are made.
-	Config Config
-
-	// HTTPClient is used to make the underlying HTTP requests.
-	// If it's nil, [http.DefaultTransport] will be used.
-	Transport http.RoundTripper
+type StdAuthorizerParams struct {
+	Config     Config
+	HTTPClient HTTPDoer
 }
 
-// NewStdTransport returns an [http.RoundTripper] implementation that
-// acquires authorization tokens using the flows implemented by the
-// usual docker clients. Note that this is _not_ documented as part of
-// any official OCI spec.
-//
-// See https://distribution.github.io/distribution/spec/auth/token/ for an overview.
-//
-// The RoundTrip method acquires authorization before invoking the
-// request. request. It may invoke the request more than once, and can
-// use [http.Request.GetBody] to reset the request body if it gets
-// consumed.
-//
-// It ensures that the authorization token used will have at least the
-// capability to execute operations in the required scope associated
-// with the request context (see [ContextWithRequestInfo]). Any other
-// auth scope inside the context (see [ContextWithScope]) may also be
-// taken into account when acquiring new tokens.
-func NewStdTransport(p StdTransportParams) http.RoundTripper {
+func NewStdAuthorizer(p StdAuthorizerParams) *StdAuthorizer {
 	if p.Config == nil {
 		p.Config = emptyConfig{}
 	}
-	if p.Transport == nil {
-		p.Transport = http.DefaultTransport
+	if p.HTTPClient == nil {
+		p.HTTPClient = http.DefaultClient
 	}
-	return &stdTransport{
+	return &StdAuthorizer{
 		config:     p.Config,
-		transport:  p.Transport,
+		httpClient: p.HTTPClient,
 		registries: make(map[string]*registry),
 	}
 }
 
+var _ Authorizer = (*StdAuthorizer)(nil)
+
+// TODO de-dupe this from ociclient.
+type HTTPDoer interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
 // registry holds currently known auth information for a registry.
 type registry struct {
-	host      string
-	transport http.RoundTripper
-	config    Config
-	initOnce  sync.Once
-	initErr   error
+	host       string
+	authorizer *StdAuthorizer
+	initOnce   sync.Once
+	initErr    error
 
 	// mu guards the fields that follow it.
 	mu sync.Mutex
@@ -115,29 +113,14 @@ type userPass struct {
 
 var forever = time.Date(99999, time.January, 1, 0, 0, 0, 0, time.UTC)
 
-// RoundTrip implements [http.RoundTripper.RoundTrip].
-func (a *stdTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// From the [http.RoundTripper] docs:
-	//	RoundTrip should not modify the request, except for
-	//	consuming and closing the Request's Body.
-	req = req.Clone(req.Context())
-
-	// From the [http.RoundTripper] docs:
-	//	RoundTrip must always close the body, including on errors, [...]
-	needBodyClose := true
-	defer func() {
-		if needBodyClose && req.Body != nil {
-			req.Body.Close()
-		}
-	}()
-
+// AuthorizeRequest implements [Authorizer.DoRequest].
+func (a *StdAuthorizer) DoRequest(req *http.Request, requiredScope Scope) (*http.Response, error) {
 	a.mu.Lock()
 	r := a.registries[req.URL.Host]
 	if r == nil {
 		r = &registry{
-			host:      req.URL.Host,
-			config:    a.config,
-			transport: a.transport,
+			host:       req.URL.Host,
+			authorizer: a,
 		}
 		a.registries[r.host] = r
 	}
@@ -146,18 +129,17 @@ func (a *stdTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	ctx := req.Context()
-	requiredScope := RequestInfoFromContext(ctx).RequiredScope
-	wantScope := ScopeFromContext(ctx)
+	wantScope := ScopeFromContext(req.Context())
+	return r.doRequest(req.Context(), req, requiredScope, wantScope)
+}
 
+// doRequest performs the given request on the registry r.
+func (r *registry) doRequest(ctx context.Context, req *http.Request, requiredScope, wantScope Scope) (*http.Response, error) {
+	// TODO set up request body so that we can rewind it when retrying if necessary.
 	if err := r.setAuthorization(ctx, req, requiredScope, wantScope); err != nil {
 		return nil, err
 	}
-	resp, err := r.transport.RoundTrip(req)
-
-	// The underlying transport should now have closed the request body
-	// so we don't have to.
-	needBodyClose = false
+	resp, err := r.authorizer.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +150,7 @@ func (a *stdTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if challenge == nil {
 		return resp, nil
 	}
-	authAdded, tokenAcquired, err := r.setAuthorizationFromChallenge(ctx, req, challenge, requiredScope, wantScope)
+	authAdded, err := r.setAuthorizationFromChallenge(ctx, req, challenge, requiredScope, wantScope)
 	if err != nil {
 		resp.Body.Close()
 		return nil, err
@@ -178,39 +160,8 @@ func (a *stdTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return resp, nil
 	}
 	resp.Body.Close()
-	// rewind request body if needed and possible.
-	if req.GetBody != nil {
-		req.Body, err = req.GetBody()
-		if err != nil {
-			return nil, err
-		}
-	}
-	resp, err = r.transport.RoundTrip(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusUnauthorized || !tokenAcquired {
-		return resp, nil
-	}
-	// The server has responded with Unauthorized (401) even though we've just
-	// provided a token that it gave us. Treat it as Forbidden (403) instead.
-	// TODO include the original body/error as part of the message or message detail?
-	resp.Body.Close()
-	data, err := json.Marshal(&ociregistry.WireErrors{
-		Errors: []ociregistry.WireError{{
-			Code_:   ociregistry.ErrDenied.Code(),
-			Message: "unauthorized response with freshly acquired auth token",
-		}},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cannot marshal response body: %v", err)
-	}
-	resp.Header.Set("Content-Type", "application/json")
-	resp.ContentLength = int64(len(data))
-	resp.Body = io.NopCloser(bytes.NewReader(data))
-	resp.StatusCode = http.StatusForbidden
-	resp.Status = http.StatusText(resp.StatusCode)
-	return resp, nil
+	// TODO rewind request body if needed.
+	return r.authorizer.httpClient.Do(req)
 }
 
 // setAuthorization sets up authorization on the given request using any
@@ -246,10 +197,7 @@ func (r *registry) setAuthorization(ctx context.Context, req *http.Request, requ
 
 		accessToken, err := r.acquireAccessToken(ctx, requiredScope, wantScope)
 		if err != nil {
-			// Avoid using %w to wrap the error because we don't want the
-			// caller of RoundTrip (usually ociclient) to assume that the
-			// error applies to the target server rather than the token server.
-			return fmt.Errorf("cannot acquire access token: %v", err)
+			return err
 		}
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		return nil
@@ -261,7 +209,7 @@ func (r *registry) setAuthorization(ctx context.Context, req *http.Request, requ
 	return nil
 }
 
-func (r *registry) setAuthorizationFromChallenge(ctx context.Context, req *http.Request, challenge *authHeader, requiredScope, wantScope Scope) (authAdded, tokenAcquired bool, _ error) {
+func (r *registry) setAuthorizationFromChallenge(ctx context.Context, req *http.Request, challenge *authHeader, requiredScope, wantScope Scope) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.wwwAuthenticate = challenge
@@ -271,15 +219,15 @@ func (r *registry) setAuthorizationFromChallenge(ctx context.Context, req *http.
 		scope := ParseScope(r.wwwAuthenticate.params["scope"])
 		accessToken, err := r.acquireAccessToken(ctx, scope, wantScope.Union(requiredScope))
 		if err != nil {
-			return false, false, err
+			return false, err
 		}
 		req.Header.Set("Authorization", "Bearer "+accessToken)
-		return true, true, nil
+		return true, nil
 	case r.basic != nil:
 		req.SetBasicAuth(r.basic.username, r.basic.password)
-		return true, false, nil
+		return true, nil
 	}
-	return false, false, nil
+	return false, nil
 }
 
 // init initializes the registry instance by acquiring auth information from
@@ -290,7 +238,7 @@ func (r *registry) setAuthorizationFromChallenge(ctx context.Context, req *http.
 // the outer context is cancelled, but we'll ignore that. We probably shouldn't.
 func (r *registry) init() error {
 	inner := func() error {
-		info, err := r.config.EntryForRegistry(r.host)
+		info, err := r.authorizer.config.EntryForRegistry(r.host)
 		if err != nil {
 			return fmt.Errorf("cannot acquire auth info for registry %q: %v", r.host, err)
 		}
@@ -329,8 +277,8 @@ func (r *registry) acquireAccessToken(ctx context.Context, requiredScope, wantSc
 	scope := requiredScope.Union(wantScope)
 	tok, err := r.acquireToken(ctx, scope)
 	if err != nil {
-		var herr ociregistry.HTTPError
-		if !errors.As(err, &herr) || herr.StatusCode() != http.StatusUnauthorized {
+		var rerr *responseError
+		if !errors.As(err, &rerr) || rerr.statusCode != http.StatusUnauthorized {
 			return "", err
 		}
 		// The documentation says this:
@@ -403,8 +351,8 @@ func (r *registry) acquireToken(ctx context.Context, scope Scope) (*wireToken, e
 		if err == nil {
 			return tok, nil
 		}
-		var herr ociregistry.HTTPError
-		if !errors.As(err, &herr) || herr.StatusCode() != http.StatusNotFound {
+		var rerr *responseError
+		if !errors.As(err, &rerr) || rerr.statusCode != http.StatusNotFound {
 			return tok, err
 		}
 		// The request to the endpoint returned 404 from the POST request,
@@ -428,7 +376,7 @@ func (r *registry) acquireToken(ctx context.Context, scope Scope) (*wireToken, e
 		v.Set("service", service)
 	}
 	u.RawQuery = v.Encode()
-	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -471,26 +419,39 @@ type wireToken struct {
 }
 
 func (r *registry) doTokenRequest(req *http.Request) (*wireToken, error) {
-	client := &http.Client{
-		Transport: r.transport,
-	}
-	resp, err := client.Do(req)
+	resp, err := r.authorizer.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, bodyErr := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, ociregistry.NewHTTPError(nil, resp.StatusCode, resp, data)
+		return nil, errorFromResponse(resp)
 	}
-	if bodyErr != nil {
-		return nil, fmt.Errorf("error reading response body: %v", err)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read response body: %v", err)
 	}
 	var tok wireToken
 	if err := json.Unmarshal(data, &tok); err != nil {
 		return nil, fmt.Errorf("malformed JSON token in response: %v", err)
 	}
 	return &tok, nil
+}
+
+type responseError struct {
+	statusCode int
+	msg        string
+}
+
+func errorFromResponse(resp *http.Response) error {
+	// TODO include body of response in error message.
+	return &responseError{
+		statusCode: resp.StatusCode,
+	}
+}
+
+func (e *responseError) Error() string {
+	return fmt.Sprintf("unexpected HTTP response %d", e.statusCode)
 }
 
 // deleteExpiredTokens removes all tokens from r that expire after the given

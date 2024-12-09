@@ -22,8 +22,8 @@ func TestMain(m *testing.M) {
 }
 
 func TestLoadWithNoConfig(t *testing.T) {
-	qt.Patch(t, &userHomeDir, func(getenv func(string) string) string {
-		return getenv("HOME")
+	qt.Patch(t, &osUserHomeDir, func() (string, error) {
+		return os.Getenv("HOME"), nil
 	})
 	t.Setenv("HOME", "")
 	t.Setenv("DOCKER_CONFIG", "")
@@ -39,8 +39,8 @@ func TestLoad(t *testing.T) {
 	// Write config files in all the places, so we can check
 	// that the precedence works OK.
 	d := t.TempDir()
-	qt.Patch(t, &userHomeDir, func(getenv func(string) string) string {
-		return getenv("HOME")
+	qt.Patch(t, &osUserHomeDir, func() (string, error) {
+		return os.Getenv("HOME"), nil
 	})
 	locations := []struct {
 		env  string
@@ -76,7 +76,6 @@ func TestLoad(t *testing.T) {
 		}
 	}
 }`), 0o666)
-		qt.Assert(t, qt.IsNil(err))
 	}
 	for _, loc := range locations {
 		t.Run(loc.env, func(t *testing.T) {
@@ -149,7 +148,6 @@ func TestWithAuthAndUsername(t *testing.T) {
 }`)
 	qt.Assert(t, qt.IsNil(err))
 	info, err := c.EntryForRegistry("someregistry.example.com")
-	qt.Assert(t, qt.IsNil(err))
 	qt.Assert(t, qt.Equals(info, ConfigEntry{
 		Username: "testuser",
 		Password: "password",
@@ -291,108 +289,6 @@ func TestWithHelperRegistryOtherError(t *testing.T) {
 	qt.Assert(t, qt.ErrorMatches(err, `error getting credentials: some error`))
 }
 
-func TestWithDefaultHelper(t *testing.T) {
-	// Note: "test" matches the executable installed using testscript in RunMain.
-	c, err := load(t, nil, `
-{
-	"credsStore": "test"
-}
-`)
-	qt.Assert(t, qt.IsNil(err))
-	info, err := c.EntryForRegistry("registry-with-basic-auth.com")
-	qt.Assert(t, qt.IsNil(err))
-	qt.Assert(t, qt.Equals(info, ConfigEntry{
-		Username: "someuser",
-		Password: "somesecret",
-	}))
-}
-
-func TestWithDefaultHelperNotFound(t *testing.T) {
-	// When there's a helper not associated with any specific
-	// host, it ignores the fact that the executable isn't
-	// found and uses the regular "auths" info.
-	// See https://github.com/cue-lang/cue/issues/2934.
-	c, err := load(t, nil, `
-{
-	"credsStore": "definitely-not-found-executable",
-	"auths": {
-		"registry-with-basic-auth.com": {
-			"username": "u1",
-			"password": "p"
-		}
-	}
-}
-`)
-	qt.Assert(t, qt.IsNil(err))
-	info, err := c.EntryForRegistry("registry-with-basic-auth.com")
-	qt.Assert(t, qt.IsNil(err))
-	qt.Assert(t, qt.Equals(info, ConfigEntry{
-		Username: "u1",
-		Password: "p",
-	}))
-}
-
-func TestWithDefaultHelperOtherError(t *testing.T) {
-	// When there's a helper not associated with any specific
-	// host, it's still an error if it's any error other than HelperNotFound.
-	errHelper := func(helperName string, serverURL string) (ConfigEntry, error) {
-		return ConfigEntry{}, fmt.Errorf("some error")
-	}
-	c, err := load(t, errHelper, `
-{
-	"credsStore": "test",
-	"auths": {
-		"registry-with-basic-auth.com": {
-			"username": "u1",
-			"password": "p"
-		}
-	}
-}
-`)
-	qt.Assert(t, qt.IsNil(err))
-	_, err = c.EntryForRegistry("registry-with-basic-auth.com")
-	qt.Assert(t, qt.ErrorMatches(err, `some error`))
-}
-
-func TestWithSpecificHelperNotFound(t *testing.T) {
-	// When there's a helper specifically configured for a host,
-	// it _is_ an error that the helper isn't found.
-	c, err := load(t, nil, `
-{
-	"credHelpers": {
-		"registry-with-basic-auth.com": "definitely-not-found-executable"
-	}
-}
-`)
-	qt.Assert(t, qt.IsNil(err))
-	_, err = c.EntryForRegistry("registry-with-basic-auth.com")
-	qt.Assert(t, qt.ErrorMatches(err, `helper not found: exec: "docker-credential-definitely-not-found-executable": executable file not found .*`))
-}
-
-func TestWithHelperAndExplicitEnv(t *testing.T) {
-	d := t.TempDir()
-	// Note: "test" matches the executable installed using testscript in RunMain.
-	err := os.WriteFile(filepath.Join(d, "config.json"), []byte(`
-{
-	"credHelpers": {
-		"registry-with-env-lookup.com": "test"
-	}
-}
-`), 0o666)
-	qt.Assert(t, qt.IsNil(err))
-	c, err := LoadWithEnv(nil, []string{
-		"DOCKER_CONFIG=" + d,
-		"TEST_SECRET=foo",
-	})
-	qt.Assert(t, qt.IsNil(err))
-	info, err := c.EntryForRegistry("registry-with-env-lookup.com")
-	qt.Assert(t, qt.IsNil(err))
-	qt.Assert(t, qt.Equals(info, ConfigEntry{
-		Username: "someuser",
-		Password: "foo",
-	}))
-}
-
 func load(t *testing.T, runner HelperRunner, cfgData string) (Config, error) {
 	d := t.TempDir()
 	t.Setenv("DOCKER_CONFIG", d)
@@ -429,12 +325,6 @@ func helperMain() int {
 	"Secret": "sometoken"
 }
 `)
-	case "registry-with-env-lookup.com":
-		fmt.Printf(`
-{
-	"Username": "someuser",
-	"Secret": %q
-}`, os.Getenv("TEST_SECRET"))
 	case "registry-with-error.com":
 		fmt.Fprintf(os.Stderr, "some error\n")
 		return 1

@@ -9,8 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"slices"
+	"sort"
 	"strings"
 )
 
@@ -46,16 +45,12 @@ type ConfigFile struct {
 	runner HelperRunner
 }
 
-var ErrHelperNotFound = errors.New("helper not found")
-
 // HelperRunner is the function used to execute auth "helper"
 // commands. It's passed the helper name as specified in the configuration file,
 // without the "docker-credential-helper-" prefix.
 //
 // If the credentials are not found, it should return the zero AuthInfo
 // and no error.
-//
-// If the helper doesn't exist, it should return an [ErrHelperNotFound] error.
 type HelperRunner = func(helperName string, serverURL string) (ConfigEntry, error)
 
 // configData holds the part of ~/.docker/config.json that pertains to auth.
@@ -85,19 +80,20 @@ type authConfig struct {
 	RegistryToken string `json:"registrytoken,omitempty"`
 }
 
-// LoadWithEnv is like [Load] but takes environment variables in the form
-// returned by [os.Environ] instead of calling [os.Getenv]. If env
-// is nil, the current process's environment will be used.
-func LoadWithEnv(runner HelperRunner, env []string) (*ConfigFile, error) {
+// Load loads the auth configuration from the first location it can find.
+// It uses runner to run any external helper commands; if runner
+// is nil, [ExecHelper] will be used.
+//
+// In order it tries:
+// - $DOCKER_CONFIG/config.json
+// - ~/.docker/config.json
+// - $XDG_RUNTIME_DIR/containers/auth.json
+func Load(runner HelperRunner) (*ConfigFile, error) {
 	if runner == nil {
-		runner = ExecHelperWithEnv(env)
-	}
-	getenv := os.Getenv
-	if env != nil {
-		getenv = getenvFunc(env)
+		runner = ExecHelper
 	}
 	for _, f := range configFileLocations {
-		filename := f(getenv)
+		filename := f()
 		if filename == "" {
 			continue
 		}
@@ -122,97 +118,43 @@ func LoadWithEnv(runner HelperRunner, env []string) (*ConfigFile, error) {
 	}, nil
 }
 
-// Load loads the auth configuration from the first location it can find.
-// It uses runner to run any external helper commands; if runner
-// is nil, [ExecHelper] will be used.
-//
-// In order it tries:
-// - $DOCKER_CONFIG/config.json
-// - ~/.docker/config.json
-// - $XDG_RUNTIME_DIR/containers/auth.json
-func Load(runner HelperRunner) (*ConfigFile, error) {
-	return LoadWithEnv(runner, nil)
-}
+// osUserHomeDir is defined as a variable so it can be overridden by tests.
+var osUserHomeDir = os.UserHomeDir
 
-func getenvFunc(env []string) func(string) string {
-	return func(key string) string {
-		for i := len(env) - 1; i >= 0; i-- {
-			if e := env[i]; len(e) >= len(key)+1 && e[len(key)] == '=' && e[:len(key)] == key {
-				return e[len(key)+1:]
-			}
-		}
-		return ""
-	}
-}
-
-var configFileLocations = []func(func(string) string) string{
-	func(getenv func(string) string) string {
-		if d := getenv("DOCKER_CONFIG"); d != "" {
+var configFileLocations = []func() string{
+	func() string {
+		if d := os.Getenv("DOCKER_CONFIG"); d != "" {
 			return filepath.Join(d, "config.json")
 		}
 		return ""
 	},
-	func(getenv func(string) string) string {
-		if home := userHomeDir(getenv); home != "" {
-			return filepath.Join(home, ".docker", "config.json")
+	func() string {
+		home, err := osUserHomeDir()
+		if err != nil {
+			return ""
 		}
-		return ""
+		return filepath.Join(home, ".docker", "config.json")
 	},
 	// If neither of the above locations was found, look for Podman's auth at
 	// $XDG_RUNTIME_DIR/containers/auth.json and attempt to load it as a
 	// Docker config.
-	func(getenv func(string) string) string {
-		if d := getenv("XDG_RUNTIME_DIR"); d != "" {
+	func() string {
+		if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
 			return filepath.Join(d, "containers", "auth.json")
 		}
 		return ""
 	},
 }
 
-// userHomeDir returns the current user's home directory.
-// The logic in this is directly derived from the logic in
-// [os.UserHomeDir] as of go 1.22.0.
-//
-// It's defined as a variable so it can be patched in tests.
-var userHomeDir = func(getenv func(string) string) string {
-	env := "HOME"
-	switch runtime.GOOS {
-	case "windows":
-		env = "USERPROFILE"
-	case "plan9":
-		env = "home"
-	}
-	if v := getenv(env); v != "" {
-		return v
-	}
-	// On some geese the home directory is not always defined.
-	switch runtime.GOOS {
-	case "android":
-		return "/sdcard"
-	case "ios":
-		return "/"
-	}
-	return ""
-}
-
 // EntryForRegistry implements [Authorizer.InfoForRegistry].
 // If no registry is found, it returns the zero [ConfigEntry] and a nil error.
 func (c *ConfigFile) EntryForRegistry(registryHostname string) (ConfigEntry, error) {
 	helper, ok := c.data.CredHelpers[registryHostname]
-	explicit := true
 	if !ok {
 		helper = c.data.CredsStore
-		explicit = false
 	}
 	if helper != "" {
-		entry, err := c.runner(helper, registryHostname)
-		if err == nil || explicit || !errors.Is(err, ErrHelperNotFound) {
-			return entry, err
-		}
-		// The helper command isn't found and it's a fallback default.
-		// Don't treat that as an error, because it's common for
-		// a helper default to be set up without the helper actually
-		// existing. See https://github.com/cue-lang/cue/issues/2934.
+		return c.runner(helper, registryHostname)
 	}
 	auth := c.data.Auths[registryHostname]
 	if auth.IdentityToken != "" && auth.Username != "" {
@@ -265,7 +207,7 @@ func decodeConfigFile(data []byte) (configData, error) {
 			ac = ac1
 		}
 		ac.derivedFrom = append(ac.derivedFrom, addr)
-		slices.Sort(ac.derivedFrom)
+		sort.Strings(ac.derivedFrom)
 		f.Auths[addr1] = ac
 	}
 	return f, nil
@@ -302,57 +244,43 @@ func decodeAuth(authStr string) (string, string, error) {
 }
 
 // ExecHelper executes an external program to get the credentials from a native store.
-// It implements [HelperRunner].
+// It implements HelperRunner.
 func ExecHelper(helperName string, serverURL string) (ConfigEntry, error) {
-	return ExecHelperWithEnv(nil)(helperName, serverURL)
-}
+	var out bytes.Buffer
+	cmd := exec.Command("docker-credential-"+helperName, "get")
+	// TODO this doesn't produce a decent error message for
+	// other helpers such as gcloud that print errors to stderr.
+	cmd.Stdin = strings.NewReader(serverURL)
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		if !errors.As(err, new(*exec.ExitError)) {
+			return ConfigEntry{}, fmt.Errorf("cannot run auth helper: %v", err)
+		}
+		t := strings.TrimSpace(out.String())
+		if t == "credentials not found in native keychain" {
+			return ConfigEntry{}, nil
+		}
+		return ConfigEntry{}, fmt.Errorf("error getting credentials: %s", t)
+	}
 
-// ExecHelperWithEnv returns a [HelperRunner] that behaves like [ExecHelper]
-// except that, if env is non-nil, it will be used as the set of environment
-// variables to pass to the executed helper command. If env is nil,
-// the current process's environment will be used.
-func ExecHelperWithEnv(env []string) HelperRunner {
-	return func(helperName string, serverURL string) (ConfigEntry, error) {
-		var out bytes.Buffer
-		cmd := exec.Command("docker-credential-"+helperName, "get")
-		// TODO this doesn't produce a decent error message for
-		// other helpers such as gcloud that print errors to stderr.
-		cmd.Stdin = strings.NewReader(serverURL)
-		cmd.Stdout = &out
-		cmd.Stderr = &out
-		cmd.Env = env
-		if err := cmd.Run(); err != nil {
-			if !errors.As(err, new(*exec.ExitError)) {
-				if errors.Is(err, exec.ErrNotFound) {
-					return ConfigEntry{}, fmt.Errorf("%w: %v", ErrHelperNotFound, err)
-				}
-				return ConfigEntry{}, fmt.Errorf("cannot run auth helper: %v", err)
-			}
-			t := strings.TrimSpace(out.String())
-			if t == "credentials not found in native keychain" {
-				return ConfigEntry{}, nil
-			}
-			return ConfigEntry{}, fmt.Errorf("error getting credentials: %s", t)
-		}
-
-		// helperCredentials defines the JSON encoding of the data printed
-		// by credentials helper programs.
-		type helperCredentials struct {
-			Username string
-			Secret   string
-		}
-		var creds helperCredentials
-		if err := json.Unmarshal(out.Bytes(), &creds); err != nil {
-			return ConfigEntry{}, err
-		}
-		if creds.Username == "<token>" {
-			return ConfigEntry{
-				RefreshToken: creds.Secret,
-			}, nil
-		}
+	// helperCredentials defines the JSON encoding of the data printed
+	// by credentials helper programs.
+	type helperCredentials struct {
+		Username string
+		Secret   string
+	}
+	var creds helperCredentials
+	if err := json.Unmarshal(out.Bytes(), &creds); err != nil {
+		return ConfigEntry{}, err
+	}
+	if creds.Username == "<token>" {
 		return ConfigEntry{
-			Password: creds.Secret,
-			Username: creds.Username,
+			RefreshToken: creds.Secret,
 		}, nil
 	}
+	return ConfigEntry{
+		Password: creds.Secret,
+		Username: creds.Username,
+	}, nil
 }

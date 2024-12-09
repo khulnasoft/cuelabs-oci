@@ -35,7 +35,6 @@ import (
 	"cuelabs.dev/go/oci/ociregistry"
 	"cuelabs.dev/go/oci/ociregistry/internal/ocirequest"
 	"cuelabs.dev/go/oci/ociregistry/ociauth"
-	"cuelabs.dev/go/oci/ociregistry/ociref"
 )
 
 // debug enables logging.
@@ -46,31 +45,21 @@ type Options struct {
 	// DebugID is used to prefix any log messages printed by the client.
 	DebugID string
 
-	// Transport is used to make HTTP requests. The context passed
-	// to its RoundTrip method will have an appropriate
-	// [ociauth.RequestInfo] value added, suitable for consumption
-	// by the transport created by [ociauth.NewStdTransport]. If
-	// Transport is nil, [http.DefaultTransport] will be used.
-	Transport http.RoundTripper
+	// HTTPClient is used to send HTTP requests. If it's nil,
+	// http.DefaultClient will be used.
+	HTTPClient HTTPDoer
 
-	// Insecure specifies whether an http scheme will be used to
-	// address the host instead of https.
+	// Authorizer is used to acquire authorization for making requests.
+	Authorizer ociauth.Authorizer
+
+	// Insecure specifies whether an http scheme will be
+	// used to address the host instead of https.
 	Insecure bool
-
-	// ListPageSize configures the maximum number of results
-	// requested when making list requests. If it's <= zero, it
-	// defaults to DefaultListPageSize.
-	ListPageSize int
 }
 
-// See https://github.com/google/go-containerregistry/issues/1091
-// for an early report of the issue alluded to below.
-
-// DefaultListPageSize holds the default number of results
-// to request when using the list endpoints.
-// It's not more than 1000 because AWS ECR complains
-// it it's more than that.
-const DefaultListPageSize = 1000
+type HTTPDoer interface {
+	Do(req *http.Request) (*http.Response, error)
+}
 
 var debugID int32
 
@@ -80,16 +69,15 @@ var debugID int32
 //
 // The host specifies the host name to talk to; it may
 // optionally be a host:port pair.
-func New(host string, opts0 *Options) (ociregistry.Interface, error) {
-	var opts Options
-	if opts0 != nil {
-		opts = *opts0
+func New(host string, opts *Options) (ociregistry.Interface, error) {
+	if opts == nil {
+		opts = &Options{}
 	}
 	if opts.DebugID == "" {
 		opts.DebugID = fmt.Sprintf("id%d", atomic.AddInt32(&debugID, 1))
 	}
-	if opts.Transport == nil {
-		opts.Transport = http.DefaultTransport
+	if opts.HTTPClient == nil {
+		opts.HTTPClient = http.DefaultClient
 	}
 	// Check that it's a valid host by forming a URL from it and checking that it matches.
 	u, err := url.Parse("https://" + host + "/path")
@@ -102,48 +90,42 @@ func New(host string, opts0 *Options) (ociregistry.Interface, error) {
 	if opts.Insecure {
 		u.Scheme = "http"
 	}
-	if opts.ListPageSize == 0 {
-		opts.ListPageSize = DefaultListPageSize
-	}
 	return &client{
 		httpHost:   host,
 		httpScheme: u.Scheme,
-		httpClient: &http.Client{
-			Transport: opts.Transport,
-		},
-		debugID:      opts.DebugID,
-		listPageSize: opts.ListPageSize,
+		client:     opts.HTTPClient,
+		authorizer: opts.Authorizer,
+		debugID:    opts.DebugID,
 	}, nil
 }
 
 type client struct {
 	*ociregistry.Funcs
-	httpScheme   string
-	httpHost     string
-	httpClient   *http.Client
-	debugID      string
-	listPageSize int
+	httpScheme string
+	httpHost   string
+	client     HTTPDoer
+	authorizer ociauth.Authorizer
+	debugID    string
 }
 
-type descriptorRequired byte
-
-const (
-	requireSize descriptorRequired = 1 << iota
-	requireDigest
-)
-
-// descriptorFromResponse tries to form a descriptor from an HTTP response,
-// filling in the Digest field using knownDigest if it's not present.
-//
-// Note: this implies that the Digest field will be empty if there is no
-// digest in the response and knownDigest is empty.
-func descriptorFromResponse(resp *http.Response, knownDigest digest.Digest, require descriptorRequired) (ociregistry.Descriptor, error) {
+func descriptorFromResponse(resp *http.Response, knownDigest digest.Digest, requireSize bool) (ociregistry.Descriptor, error) {
+	digest := digest.Digest(resp.Header.Get("Docker-Content-Digest"))
+	if digest != "" {
+		if !ociregistry.IsValidDigest(string(digest)) {
+			return ociregistry.Descriptor{}, fmt.Errorf("bad digest %q found in response", digest)
+		}
+	} else {
+		if knownDigest == "" {
+			return ociregistry.Descriptor{}, fmt.Errorf("no digest found in response")
+		}
+		digest = knownDigest
+	}
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 	size := int64(0)
-	if (require & requireSize) != 0 {
+	if requireSize {
 		if resp.StatusCode == http.StatusPartialContent {
 			contentRange := resp.Header.Get("Content-Range")
 			if contentRange == "" {
@@ -164,17 +146,6 @@ func descriptorFromResponse(resp *http.Response, knownDigest digest.Digest, requ
 			}
 			size = resp.ContentLength
 		}
-	}
-	digest := digest.Digest(resp.Header.Get("Docker-Content-Digest"))
-	if digest != "" {
-		if !ociref.IsValidDigest(string(digest)) {
-			return ociregistry.Descriptor{}, fmt.Errorf("bad digest %q found in response", digest)
-		}
-	} else {
-		digest = knownDigest
-	}
-	if (require&requireDigest) != 0 && digest == "" {
-		return ociregistry.Descriptor{}, fmt.Errorf("no digest found in response")
 	}
 	return ociregistry.Descriptor{
 		Digest:    digest,
@@ -267,7 +238,7 @@ func (c *client) doRequest(ctx context.Context, rreq *ocirequest.Request, okStat
 		// add all the manifest kinds that we know about.
 		req.Header["Accept"] = knownManifestMediaTypes
 	}
-	resp, err := c.do(req, okStatuses...)
+	resp, err := c.do(req, scopeForRequest(rreq), okStatuses...)
 	if err != nil {
 		return nil, err
 	}
@@ -278,7 +249,7 @@ func (c *client) doRequest(ctx context.Context, rreq *ocirequest.Request, okStat
 	return nil, makeError(resp)
 }
 
-func (c *client) do(req *http.Request, okStatuses ...int) (*http.Response, error) {
+func (c *client) do(req *http.Request, needScope ociauth.Scope, okStatuses ...int) (*http.Response, error) {
 	if req.URL.Scheme == "" {
 		req.URL.Scheme = c.httpScheme
 	}
@@ -302,7 +273,13 @@ func (c *client) do(req *http.Request, okStatuses ...int) (*http.Response, error
 		}
 		c.logf("%s", buf.Bytes())
 	}
-	resp, err := c.httpClient.Do(req)
+	var resp *http.Response
+	var err error
+	if c.authorizer != nil {
+		resp, err = c.authorizer.DoRequest(req, needScope)
+	} else {
+		resp, err = c.client.Do(req)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot do HTTP request: %w", err)
 	}
@@ -416,8 +393,5 @@ func newRequest(ctx context.Context, rreq *ocirequest.Request, body io.Reader) (
 	if err != nil {
 		return nil, err
 	}
-	ctx = ociauth.ContextWithRequestInfo(ctx, ociauth.RequestInfo{
-		RequiredScope: scopeForRequest(rreq),
-	})
 	return http.NewRequestWithContext(ctx, method, u, body)
 }

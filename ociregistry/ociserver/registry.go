@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package ociserver implements a docker V2 registry and the OCI distribution specification.
+// Package ociregistry implements a docker V2 registry and the OCI distribution specification.
 //
-// It is designed to be used anywhere a low dependency container registry is needed.
+// It is designed to be used anywhere a low dependency container registry is needed, with an
+// initial focus on tests.
 //
 // Its goal is to be standards compliant and its strictness will increase over time.
+//
+// This is currently a low flightmiles system. It's likely quite safe to use in tests; If you're using it
+// in production, please let us know how and send us CL's for integration tests.
 package ociserver
 
 import (
@@ -41,14 +45,6 @@ var v2 = ocispecroot.Versioned{
 
 // Options holds options for the server.
 type Options struct {
-	// WriteError is used to write error responses. It is passed the
-	// writer to write the error response to, the request that
-	// the error is in response to, and the error itself.
-	//
-	// If WriteError is nil, [ociregistry.WriteError] will
-	// be used and any error discarded.
-	WriteError func(w http.ResponseWriter, req *http.Request, err error)
-
 	// DisableReferrersAPI, when true, causes the registry to behave as if
 	// it does not understand the referrers API.
 	DisableReferrersAPI bool
@@ -59,22 +55,6 @@ type Options struct {
 	// to cause uploaded blob content to flow through
 	// another server.
 	DisableSinglePostUpload bool
-
-	// MaxListPageSize, if > 0, causes the list endpoints to return an
-	// error if the page size is greater than that. This emulates
-	// a quirk of AWS ECR where it refuses request for any
-	// page size > 1000.
-	MaxListPageSize int
-
-	// OmitDigestFromTagGetResponse causes the registry
-	// to omit the Docker-Content-Digest header from a tag
-	// GET response, mimicking the behavior of registries that
-	// do the same (for example AWS ECR).
-	OmitDigestFromTagGetResponse bool
-
-	// OmitLinkHeaderFromResponses causes the server
-	// to leave out the Link header from list responses.
-	OmitLinkHeaderFromResponses bool
 
 	// LocationForUploadID transforms an upload ID as returned by
 	// ocirequest.BlobWriter.ID to the absolute URL location
@@ -119,17 +99,6 @@ var debugID int32
 // If opts is nil, it's equivalent to passing new(Options).
 //
 // The returned handler should be registered at the site root.
-//
-// # Errors
-//
-// All HTTP responses will be JSON, formatted according to the
-// OCI spec. If an error returned from backend conforms to
-// [ociregistry.Error], the associated code and detail will be used.
-//
-// The HTTP response code will be determined from the error
-// code when possible. If it can't be determined and the
-// error implements [ociregistry.HTTPError], the code returned
-// by StatusCode will be used as the HTTP response code.
 func New(backend ociregistry.Interface, opts *Options) http.Handler {
 	if opts == nil {
 		opts = new(Options)
@@ -140,11 +109,6 @@ func New(backend ociregistry.Interface, opts *Options) http.Handler {
 	}
 	if r.opts.DebugID == "" {
 		r.opts.DebugID = fmt.Sprintf("ociserver%d", atomic.AddInt32(&debugID, 1))
-	}
-	if r.opts.WriteError == nil {
-		r.opts.WriteError = func(w http.ResponseWriter, _ *http.Request, err error) {
-			ociregistry.WriteError(w, err)
-		}
 	}
 	return r
 }
@@ -180,7 +144,7 @@ var handlers = []func(r *registry, ctx context.Context, w http.ResponseWriter, r
 
 func (r *registry) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
 	if rerr := r.v2(resp, req); rerr != nil {
-		r.opts.WriteError(resp, req, rerr)
+		writeError(resp, rerr)
 		return
 	}
 }

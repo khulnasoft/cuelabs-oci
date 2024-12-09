@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/opencontainers/go-digest"
@@ -51,12 +50,9 @@ func (c *client) PushManifest(ctx context.Context, repo string, tag string, cont
 		Digest: string(desc.Digest),
 	}
 	req, err := newRequest(ctx, rreq, bytes.NewReader(contents))
-	if err != nil {
-		return ociregistry.Descriptor{}, err
-	}
 	req.Header.Set("Content-Type", mediaType)
 	req.ContentLength = desc.Size
-	resp, err := c.do(req, http.StatusCreated)
+	resp, err := c.do(req, scopeForRequest(rreq), http.StatusCreated)
 	if err != nil {
 		return ociregistry.Descriptor{}, err
 	}
@@ -82,8 +78,7 @@ func (c *client) MountBlob(ctx context.Context, fromRepo, toRepo string, dig oci
 		// return Unsupported.
 		return ociregistry.Descriptor{}, fmt.Errorf("registry does not support mounts: %w", ociregistry.ErrUnsupported)
 	}
-	// TODO: is it OK to omit the size from the returned descriptor here?
-	return descriptorFromResponse(resp, dig, requireDigest)
+	return descriptorFromResponse(resp, dig, false)
 }
 
 func (c *client) PushBlob(ctx context.Context, repo string, desc ociregistry.Descriptor, r io.Reader) (_ ociregistry.Descriptor, _err error) {
@@ -99,7 +94,7 @@ func (c *client) PushBlob(ctx context.Context, repo string, desc ociregistry.Des
 	if err != nil {
 		return ociregistry.Descriptor{}, err
 	}
-	resp, err := c.do(req, http.StatusAccepted)
+	resp, err := c.do(req, scopeForRequest(rreq), http.StatusAccepted)
 	if err != nil {
 		return ociregistry.Descriptor{}, err
 	}
@@ -111,9 +106,6 @@ func (c *client) PushBlob(ctx context.Context, repo string, desc ociregistry.Des
 
 	// We've got the upload location. Now PUT the content.
 
-	ctx = ociauth.ContextWithRequestInfo(ctx, ociauth.RequestInfo{
-		RequiredScope: scopeForRequest(rreq),
-	})
 	// Note: we can't use ocirequest.Request here because that's
 	// specific to the ociserver implementation in this case.
 	req, err = http.NewRequestWithContext(ctx, "PUT", "", r)
@@ -125,7 +117,7 @@ func (c *client) PushBlob(ctx context.Context, repo string, desc ociregistry.Des
 	req.Header.Set("Content-Type", "application/octet-stream")
 	// TODO: per the spec, the content-range header here is unnecessary.
 	req.Header.Set("Content-Range", ocirequest.RangeString(0, desc.Size))
-	resp, err = c.do(req, http.StatusCreated)
+	resp, err = c.do(req, scopeForRequest(rreq), http.StatusCreated)
 	if err != nil {
 		return ociregistry.Descriptor{}, err
 	}
@@ -155,19 +147,17 @@ func (c *client) PushBlobChunked(ctx context.Context, repo string, chunkSize int
 	if err != nil {
 		return nil, err
 	}
-	ctx = ociauth.ContextWithRequestInfo(ctx, ociauth.RequestInfo{
-		RequiredScope: ociauth.NewScope(ociauth.ResourceScope{
-			ResourceType: "repository",
-			Resource:     repo,
-			Action:       "push",
-		}),
-	})
 	return &blobWriter{
 		ctx:       ctx,
 		client:    c,
 		chunkSize: chunkSizeFromResponse(resp, chunkSize),
 		chunk:     make([]byte, 0, chunkSize),
 		location:  location,
+		scope: ociauth.NewScope(ociauth.ResourceScope{
+			ResourceType: "repository",
+			Resource:     repo,
+			Action:       "push",
+		}),
 	}, nil
 }
 
@@ -183,23 +173,20 @@ func (c *client) PushBlobChunkedResume(ctx context.Context, repo string, id stri
 	case offset == -1:
 		// Try to find what offset we're meant to be writing at
 		// by doing a GET to the location.
-		// TODO does resuming an upload require push or pull scope or both?
-		ctx := ociauth.ContextWithRequestInfo(ctx, ociauth.RequestInfo{
-			RequiredScope: ociauth.NewScope(ociauth.ResourceScope{
-				ResourceType: "repository",
-				Resource:     repo,
-				Action:       "push",
-			}, ociauth.ResourceScope{
-				ResourceType: "repository",
-				Resource:     repo,
-				Action:       "pull",
-			}),
-		})
-		req, err := http.NewRequestWithContext(ctx, "GET", id, nil)
+		req, err := http.NewRequest("GET", id, nil)
 		if err != nil {
 			return nil, err
 		}
-		resp, err := c.do(req, http.StatusNoContent)
+		// TODO does resuming an upload require push or pull scope or both?
+		resp, err := c.do(req, ociauth.NewScope(ociauth.ResourceScope{
+			ResourceType: "repository",
+			Resource:     repo,
+			Action:       "push",
+		}, ociauth.ResourceScope{
+			ResourceType: "repository",
+			Resource:     repo,
+			Action:       "pull",
+		}), http.StatusNoContent)
 		if err != nil {
 			return nil, fmt.Errorf("cannot recover chunk offset: %v", err)
 		}
@@ -225,22 +212,7 @@ func (c *client) PushBlobChunkedResume(ctx context.Context, repo string, id stri
 		if err != nil {
 			return nil, fmt.Errorf("provided ID is not a valid location URL")
 		}
-		if !strings.HasPrefix(location.Path, "/") {
-			// Our BlobWriter.ID method always returns a fully
-			// qualified absolute URL, so this must be a mistake
-			// on the part of the caller.
-			// We allow a relative URL even though we don't
-			// ever return one to make things a bit easier for tests.
-			return nil, fmt.Errorf("provided upload ID %q has unexpected relative URL path", id)
-		}
 	}
-	ctx = ociauth.ContextWithRequestInfo(ctx, ociauth.RequestInfo{
-		RequiredScope: ociauth.NewScope(ociauth.ResourceScope{
-			ResourceType: "repository",
-			Resource:     repo,
-			Action:       "push",
-		}),
-	})
 	return &blobWriter{
 		ctx:       ctx,
 		client:    c,
@@ -248,6 +220,11 @@ func (c *client) PushBlobChunkedResume(ctx context.Context, repo string, id stri
 		size:      offset,
 		flushed:   offset,
 		location:  location,
+		scope: ociauth.NewScope(ociauth.ResourceScope{
+			ResourceType: "repository",
+			Resource:     repo,
+			Action:       "push",
+		}),
 	}, nil
 }
 
@@ -255,6 +232,7 @@ type blobWriter struct {
 	client    *client
 	chunkSize int
 	ctx       context.Context
+	scope     ociauth.Scope
 
 	// mu guards the fields below it.
 	mu       sync.Mutex
@@ -270,6 +248,12 @@ type blobWriter struct {
 	// Each successfully flushed chunk increases this.
 	flushed  int64
 	location *url.URL
+	response chan doResult
+}
+
+type doResult struct {
+	resp *http.Response
+	err  error
 }
 
 func (w *blobWriter) Write(buf []byte) (int, error) {
@@ -302,6 +286,7 @@ func (w *blobWriter) flush(buf []byte, commitDigest ociregistry.Digest) error {
 		return nil
 	}
 	// Start a new PATCH request to send the currently outstanding data.
+	// It'll send on w.response when done.
 	method := "PATCH"
 	expect := http.StatusAccepted
 	reqURL := w.location
@@ -321,7 +306,7 @@ func (w *blobWriter) flush(buf []byte, commitDigest ociregistry.Digest) error {
 	// TODO: per the spec, the content-range header here is unnecessary
 	// if we are doing a final PUT without a body.
 	req.Header.Set("Content-Range", ocirequest.RangeString(w.flushed, w.flushed+req.ContentLength))
-	resp, err := w.client.do(req, expect)
+	resp, err := w.client.do(req, w.scope, expect)
 	if err != nil {
 		return err
 	}
@@ -332,6 +317,7 @@ func (w *blobWriter) flush(buf []byte, commitDigest ociregistry.Digest) error {
 	}
 	// TODO is there something we could be doing with the Range header in the response?
 	w.location = location
+	w.response = nil
 	w.flushed += req.ContentLength
 	w.chunk = w.chunk[:0]
 	return nil
@@ -388,7 +374,7 @@ func (w *blobWriter) Commit(digest ociregistry.Digest) (ociregistry.Descriptor, 
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.flush(nil, digest); err != nil {
-		return ociregistry.Descriptor{}, fmt.Errorf("cannot flush data before commit: %w", err)
+		return ociregistry.Descriptor{}, fmt.Errorf("cannot flush data before commit: %v", err)
 	}
 	return ociregistry.Descriptor{
 		MediaType: "application/octet-stream",

@@ -15,15 +15,97 @@
 package ociserver
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 
 	"cuelabs.dev/go/oci/ociregistry"
 )
 
-func withHTTPCode(statusCode int, err error) error {
-	return ociregistry.NewHTTPError(err, statusCode, nil, nil)
+type wireError struct {
+	Code    string `json:"code"`
+	Message string `json:"message,omitempty"`
+	Detail  any    `json:"detail,omitempty"`
+}
+
+type wireErrors struct {
+	Errors []wireError `json:"errors"`
+}
+
+func writeError(resp http.ResponseWriter, err error) {
+	e := wireError{
+		Message: err.Error(),
+	}
+	var ociErr ociregistry.Error
+	if errors.As(err, &ociErr) {
+		e.Code = ociErr.Code()
+		e.Detail = ociErr.Detail()
+	} else {
+		// This is contrary to spec, but it's what the Docker registry
+		// does, so it can't be too bad.
+		e.Code = "UNKNOWN"
+	}
+	httpStatus := http.StatusInternalServerError
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		httpStatus = statusErr.status
+	} else if status, ok := errorStatuses[e.Code]; ok {
+		httpStatus = status
+	}
+	resp.Header().Set("Content-Type", "application/json")
+	resp.WriteHeader(httpStatus)
+
+	data, err := json.Marshal(wireErrors{
+		Errors: []wireError{e},
+	})
+	if err != nil {
+		// TODO log
+	}
+	resp.Write(data)
+}
+
+var errorStatuses = map[string]int{
+	ociregistry.ErrBlobUnknown.Code():         http.StatusNotFound,
+	ociregistry.ErrBlobUploadInvalid.Code():   http.StatusRequestedRangeNotSatisfiable,
+	ociregistry.ErrBlobUploadUnknown.Code():   http.StatusNotFound,
+	ociregistry.ErrDigestInvalid.Code():       http.StatusBadRequest,
+	ociregistry.ErrManifestBlobUnknown.Code(): http.StatusNotFound,
+	ociregistry.ErrManifestInvalid.Code():     http.StatusBadRequest,
+	ociregistry.ErrManifestUnknown.Code():     http.StatusNotFound,
+	ociregistry.ErrNameInvalid.Code():         http.StatusBadRequest,
+	ociregistry.ErrNameUnknown.Code():         http.StatusNotFound,
+	ociregistry.ErrSizeInvalid.Code():         http.StatusBadRequest,
+	ociregistry.ErrUnauthorized.Code():        http.StatusUnauthorized,
+	ociregistry.ErrDenied.Code():              http.StatusForbidden,
+	ociregistry.ErrUnsupported.Code():         http.StatusBadRequest,
+	ociregistry.ErrTooManyRequests.Code():     http.StatusTooManyRequests,
+	ociregistry.ErrRangeInvalid.Code():        http.StatusRequestedRangeNotSatisfiable,
 }
 
 func badAPIUseError(f string, a ...any) error {
 	return ociregistry.NewError(fmt.Sprintf(f, a...), ociregistry.ErrUnsupported.Code(), nil)
+}
+
+func withHTTPCode(status int, err error) error {
+	if err == nil {
+		panic("expected error to wrap")
+	}
+	return &httpStatusError{
+		err:    err,
+		status: status,
+	}
+}
+
+type httpStatusError struct {
+	err    error
+	status int
+}
+
+func (e *httpStatusError) Unwrap() error {
+	return e.err
+}
+
+func (e *httpStatusError) Error() string {
+	return e.err.Error()
 }

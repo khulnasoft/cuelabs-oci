@@ -21,7 +21,6 @@ import (
 	"sync"
 
 	"cuelabs.dev/go/oci/ociregistry"
-	"cuelabs.dev/go/oci/ociregistry/ociref"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -121,7 +120,7 @@ func (r *Registry) blobForDigest(repoName string, dig ociregistry.Digest) (*blob
 }
 
 func (r *Registry) makeRepo(repoName string) (*repository, error) {
-	if !ociref.IsValidRepository(repoName) {
+	if !ociregistry.IsValidRepoName(repoName) {
 		return nil, ociregistry.ErrNameInvalid
 	}
 	if r.repos == nil {

@@ -15,57 +15,20 @@ bashWorkflow: json.#Workflow & {
 	jobs: [string]: defaults: run: shell: "bash"
 }
 
-installGo: {
-	#setupGo: json.#step & {
-		name: "Install Go"
-		uses: "actions/setup-go@v5"
-		with: {
-			// We do our own caching in setupGoActionsCaches.
-			cache:        false
-			"go-version": string
-		}
+installGo: json.#step & {
+	name: "Install Go"
+	uses: "actions/setup-go@v4"
+	with: {
+		// We do our own caching in setupGoActionsCaches.
+		cache:        false
+		"go-version": string
 	}
-
-	// Why set GOTOOLCHAIN here? As opposed to an environment variable
-	// elsewhere? No perfect answer to this question but here is the thinking:
-	//
-	// Setting the variable here localises it with the installation of Go. Doing
-	// it elsewhere creates distance between the two steps which are
-	// intrinsically related. And it's also hard to do: "when we use this step,
-	// also ensure that we establish an environment variable in the job for
-	// GOTOOLCHAIN".
-	//
-	// Environment variables can only be set at a workflow, job or step level.
-	// Given we currently use a matrix strategy which varies the Go version,
-	// that rules out using an environment variable based approach, because the
-	// Go version is only available at runtime via GitHub actions provided
-	// context. Whether we should instead be templating multiple workflows (i.e.
-	// exploding the matrix ourselves) is a different question, but one that
-	// has performance implications.
-	//
-	// So as clumsy as it is to use a step "template" that includes more than
-	// one step, it's the best option available to us for now.
-	[
-		#setupGo,
-
-		{
-			json.#step & {
-				name: "Set common go env vars"
-				run: """
-					go env -w GOTOOLCHAIN=local
-
-					# Dump env for good measure
-					go env
-					"""
-			}
-		},
-	]
 }
 
 checkoutCode: {
 	#actionsCheckout: json.#step & {
 		name: "Checkout code"
-		uses: "actions/checkout@v4"
+		uses: "actions/checkout@v3"
 
 		// "pull_request" builds will by default use a merge commit,
 		// testing the PR's HEAD merged on top of the master branch.
@@ -128,7 +91,15 @@ checkoutCode: {
 			name: "Check we don't have \(dispatchTrailer) on a protected branch"
 			if:   "\(isProtectedBranch) && \(containsDispatchTrailer)"
 			run:  """
-				echo "\(_dispatchTrailerVariable) contains \(dispatchTrailer) but we are on a protected branch"
+				echo "\(_dispatchTrailerVariable) contains \(dispatchTrailer)"
+				echo "\(_dispatchTrailerVariable) value"
+				cat <<EOD
+				${{ \(_dispatchTrailerVariable) }}
+				EOD
+				echo "containsDispatchTrailer expression"
+				cat <<EOD
+				\(containsDispatchTrailer)
+				EOD
 				false
 				"""
 		},
@@ -137,7 +108,60 @@ checkoutCode: {
 
 earlyChecks: json.#step & {
 	name: "Early git and code sanity checks"
-	run:  *"go run cuelang.org/go/internal/ci/checks@v0.11.0-0.dev.0.20240903133435-46fb300df650" | string
+	run: #"""
+		# Ensure the recent commit messages have Signed-off-by headers. We
+		# only need to check the HEAD commit because all commits are tested
+		# in CI. Unclear why git log outputs blank lines when parsing trailers
+		# in this way, but we remove those blank lines so as not to skew the
+		# count of the trailers we are searching for.
+		#
+		# TODO: Remove once this is enforced for admins too;
+		# see https://bugs.chromium.org/p/gerrit/issues/detail?id=15229
+		if [[ "$(git log -1 --pretty='%(trailers:key=Signed-off-by)' | sed '/^\s*$/d' | wc -l)" -eq 0 ]]; then
+			echo -e "\nRecent commit is lacking Signed-off-by:\n"
+			git show --quiet
+			exit 1
+		fi
+
+		# Ensure that commit messages have a blank second line.
+		# We know that a commit message must be longer than a single
+		# line because each commit must be signed-off.
+		if git log --format=%B -n 1 HEAD | sed -n '2{/^$/{q1}}'; then
+			echo "second line of commit message must be blank"
+			exit 1
+		fi
+
+		# Ensure that the commit author is the same as the signed-off-by.  This
+		# is a basic requirement of DCO. It is enforced by Gerrit (although
+		# noting that in Gerrit the author name does not have to match, only
+		# the email address), but _not_ by the DCO GitHub app:
+		#
+		#   https://github.com/dcoapp/app/issues/201
+		#
+		# Provide a sanity check as part of GitHub workflows that should enforce
+		# this, e.g. trybot workflows.
+		#
+		# We do so by comparing the commit author and "Signed-off-by" trailer for
+		# strict equality. Whilst this is more strict than Gerrit, it should
+		# generally be the case, and we can always relax this when presented with
+		# specific situations where it is is a problem.
+
+		# commit author email address
+		commitauthor="$(git log -1 --pretty="%ae")"
+
+		# signed-off-by trailer email address. There is no way to parse just the
+		# email address from the trailer in the same way as git log, so instead
+		# grab the relevant trailer and then take the last whitespace-delimited
+		# part as the "<>" contained email address.
+		# Getting the Signed-off-by trailer in this way causes blank
+		# lines for some reason. Use awk to remove them.
+		commitsigner="$(git log -1 --pretty='%(trailers:key=Signed-off-by,valueonly)' | sed -ne 's/.* <\(.*\)>/\1/p')"
+
+		if [[ "$commitauthor" != "$commitsigner" ]]; then
+			echo "commit author email address does not match signed-off-by trailer"
+			exit 1
+		fi
+		"""#
 }
 
 curlGitHubAPI: {
@@ -215,7 +239,7 @@ setupGoActionsCaches: {
 		if !#readonly {
 			cacheStep & {
 				if:   readWriteCacheExpr
-				uses: "actions/cache@v4"
+				uses: "actions/cache@v3"
 			}
 		},
 
@@ -228,7 +252,7 @@ setupGoActionsCaches: {
 				if: "! \(readWriteCacheExpr)"
 			}
 
-			uses: "actions/cache/restore@v4"
+			uses: "actions/cache/restore@v3"
 		},
 
 		if #cleanTestCache {
@@ -254,7 +278,7 @@ setupGoActionsCaches: {
 // but array literals are not yet supported in expressions.
 isProtectedBranch: {
 	#trailers: [...string]
-	"((" + strings.Join([for branch in protectedBranchPatterns {
+	"((" + strings.Join([ for branch in protectedBranchPatterns {
 		(_matchPattern & {variable: "github.ref", pattern: "refs/heads/\(branch)"}).expr
 	}], " || ") + ") && (! \(containsDispatchTrailer)))"
 }
@@ -272,7 +296,6 @@ isReleaseTag: {
 
 checkGitClean: json.#step & {
 	name: "Check that git is clean at the end of the job"
-	if:   "always()"
 	run:  "test -z \"$(git status --porcelain)\" || (git status; git diff; false)"
 }
 
@@ -285,7 +308,7 @@ repositoryDispatch: json.#step & {
 
 	name: string
 	run:  #"""
-			\#(_curlGitHubAPI) --fail --request POST --data-binary \#(strconv.Quote(encjson.Marshal(#arg))) https://api.github.com/repos/\#(#githubRepositoryPath)/dispatches
+			\#(_curlGitHubAPI) -f --request POST --data-binary \#(strconv.Quote(encjson.Marshal(#arg))) https://api.github.com/repos/\#(#githubRepositoryPath)/dispatches
 			"""#
 }
 
@@ -331,7 +354,7 @@ containsDispatchTrailer: {
 	//
 	//     Dispatch-Trailer: {"type:}
 	//
-	let _typeCheck = [if #type != _|_ {#type + "\""}, ""][0]
+	let _typeCheck = [ if #type != _|_ {#type + "\""}, ""][0]
 	"""
 	(contains(\(_dispatchTrailerVariable), '\n\(dispatchTrailer): {"type":"\(_typeCheck)'))
 	"""
