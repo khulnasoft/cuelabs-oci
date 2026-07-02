@@ -3,7 +3,7 @@
 
 module cuelabs.dev/go/oci/ociregistry/internal/conformance
 
-go 1.21
+go 1.25.0
 
 // Note that we use a replace directive for the ociregistry module
 // even though we're using a go.work workspace as well,
@@ -34,8 +34,8 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/onsi/ginkgo/v2 v2.11.0 // indirect
 	github.com/rogpeppe/go-internal v1.10.1-0.20230524175051-ec119421bb97 // indirect
-	golang.org/x/net v0.16.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.4.0 // indirect
-	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/tools v0.14.0 // indirect
 )
